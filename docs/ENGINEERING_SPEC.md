@@ -2,7 +2,7 @@
 
 Status: Draft  
 Owners: Engineering  
-PRD revision: <!-- prd-sha256: ee772b8759c8c7c6d36497b1960901301cd86a946e48b5f03ff98f795d6d2f22 -->
+PRD revision: <!-- prd-sha256: 0ec72ac8a9c6defcbea9133131b9223aad21cd3c8a18aace22e400b160b80b0e -->
 
 ## Scope
 
@@ -14,8 +14,9 @@ adapters.
 
 ## Barebones MVP slice
 
-The first slice runs as a TypeScript backend on Vercel, stores notes and daily
-state in managed PostgreSQL, accepts inbound text through a Twilio adapter, and
+The first slice runs as a TypeScript backend on Vercel, stores notes and
+organization snapshots in managed PostgreSQL, accepts inbound text through a
+Twilio adapter, and
 uses the OpenAI Responses API to produce structured summaries and plans. There
 is no frontend, MMS, email, or self-serve onboarding in this slice.
 
@@ -40,34 +41,42 @@ export type NoteCreatedV1 = {
 ```
 
 The SMS workstream converts a valid provider message into a committed `Note`,
-then emits `NoteCreatedV1`. The organizer workstream receives the event, loads
-the note and its household/day peers from PostgreSQL, and updates the daily
-state. Test fixtures create the same `Note` shape and bypass Twilio entirely.
+then emits `NoteCreatedV1`. The organizer workstream receives the event, derives
+its day window, loads all notes in that window from PostgreSQL, and saves a new
+organization snapshot. Test fixtures create the same `Note` shape and bypass
+Twilio entirely.
 
 The event carries no message body, phone number, household routing data, or
 provider payload. PostgreSQL is the system of record. Emission must occur only
 after the note is committed; a production implementation should use an outbox
 or equivalent durable mechanism.
 
-### Barebones organization input
+### Organization contract
 
 ```ts
-export type OrganizeDayInput = {
+export type OrganizationWindow = {
+  kind: "day" | "week" | "month";
+  startDate: string;        // inclusive household-local YYYY-MM-DD
+  endDateExclusive: string; // exclusive household-local YYYY-MM-DD
+};
+
+export type OrganizeInput = {
   householdId: string;
-  localDate: string;
-  timezone: string;
-  notes: Array<{
-    id: string;
-    authorName: string;
-    text: string;
-    receivedAt: string;
-  }>;
+  window: OrganizationWindow;
+  reason: "note.created" | "manual" | "scheduled" | "retry";
 };
 ```
 
-`organizeDay` is provider-neutral and can be exercised from a fixture-backed CLI
-or test. It returns a schema-validated summary, plan items, and the source note
-IDs used for each result.
+`organize` is provider-neutral and reloads its own source notes from PostgreSQL.
+It returns and persists a schema-validated summary, plan items, digest text, and
+the source note IDs used for each result. Day, week, and month helpers may build
+windows for callers; only day windows are implemented and tested in the
+barebones slice.
+
+`appendNote` owns validation, idempotency, and persistence only. A separate
+orchestrator may call `appendNote` and then `organize`, while the Twilio path may
+trigger `organize` asynchronously after commit. This separation allows manual
+reorganization, scheduled organization, and retries without replaying ingestion.
 
 ## Proposed architecture
 
@@ -100,12 +109,17 @@ cost without improving household isolation or delivery reliability.
    and calls the core note-ingestion function.
 2. Core ingestion stores one immutable `Note` and emits `NoteCreatedV1` after the
    transaction commits.
-3. The organizer loads all notes for that household/local date and submits them
-   to the OpenAI Responses API using Structured Outputs.
-4. Deterministic validation requires valid source note IDs and dates before a
-   versioned daily summary and plan are saved.
-5. A digest renderer reads the daily state and produces plain SMS text. It can be
+3. Every newly committed note triggers one organization attempt. A duplicate
+   provider delivery returns the existing note and does not trigger organization.
+4. The organizer derives a day window, loads every note in that window, and
+   submits them to the OpenAI Responses API using Structured Outputs.
+5. Deterministic validation requires valid source note IDs and dates before an
+   immutable, versioned organization snapshot is saved.
+6. A digest renderer reads the snapshot and produces plain SMS text. It can be
    invoked manually in the first slice; a scheduler and outbound delivery follow.
+
+AI failure never rolls back or deletes the note. The failed attempt remains
+retryable through a later `organize` call.
 
 ## Data model
 
@@ -118,7 +132,7 @@ cost without improving household isolation or delivery reliability.
 | EmailIdentity | id, normalized_email, verified_at |
 | ConsentEvent | household_id, membership_id, channel, destination_id, action, source, occurred_at |
 | Note | id, household_id, author_id, text, received_at, local_date, source_provider, source_external_id |
-| DailyState | household_id, local_date, version, summary_json, plan_json, updated_at |
+| OrganizationSnapshot | id, household_id, window_kind, start_date, end_date_exclusive, version, summary, plan_json, digest_text, source_note_ids, created_at |
 | OutboxEvent | id, event_type, schema_version, aggregate_id, payload, created_at, published_at |
 | Media | id, note_id, object_key, media_type, scan_status, byte_size |
 | Item | id, household_id, source_message_id, type, status, title, due_at, confidence |
@@ -127,9 +141,18 @@ cost without improving household isolation or delivery reliability.
 | Delivery | id, channel, digest_id/message_id, recipient_id, provider_id, status, attempts |
 
 The barebones migration needs only Household, Membership/PhoneIdentity, Note,
-DailyState, and an event handoff. `(source_provider, source_external_id)` is
-unique. All household-owned tables include `household_id`; provider payloads are
-adapter concerns and are not inputs to the organizer.
+OrganizationSnapshot, and an event handoff. `(source_provider,
+source_external_id)` is unique. Snapshot versions are unique by
+`(household_id, window_kind, start_date, version)`. All household-owned tables
+include `household_id`; provider payloads are adapter concerns and are not
+inputs to the organizer.
+
+For two-person development, use one managed Neon PostgreSQL development database
+and one committed migration history. Seed stable `tony-test`, `partner-test`, and
+`shared-demo` households. Each developer uses the same `DATABASE_URL` but sets a
+different `HOMIE_HOUSEHOLD_ID` locally, so both exercise the same schema without
+overwriting each other's notes or snapshots. Secrets stay in uncommitted
+`.env.local` files; `.env.example` documents the required variable names.
 
 ## Interfaces
 
@@ -156,10 +179,10 @@ Outbound status handling is deferred until automated digest delivery is added.
   `POST /webhooks/twilio/sendgrid/events` to update delivery, bounce, spam-report,
   and unsubscribe state idempotently.
 
-### OpenAI daily-note organization
+### OpenAI note organization
 
 - Call `POST /v1/responses` from a worker, never from the inbound webhook path.
-- Provide only normalized notes for one household/local date; do not send phone
+- Provide only normalized notes for one organization window; do not send phone
   numbers, email addresses, provider identifiers, or raw webhook data.
 - For the barebones slice, require Structured Outputs matching a versioned schema
   for `summary`, `plan_item`, and `source_note_ids`. Richer event, task, reminder,
@@ -170,6 +193,9 @@ Outbound status handling is deferred until automated digest delivery is added.
   never log prompt or response content.
 - A failed or invalid model response leaves source notes intact and retryable; it
   must never block ingestion or fabricate a successful digest.
+- Use the real Responses API for the curated fixture and manual end-to-end path.
+  A deterministic stub is acceptable only for database and unit tests. Configure
+  the model with `OPENAI_MODEL`, set `store: false`, and never commit the API key.
 
 ### Organizer API
 
@@ -228,7 +254,11 @@ each delivery.
   create the same `Note` shape and emit `NoteCreatedV1`.
 - Organizer tests run from fixtures without Twilio credentials; Twilio adapter
   tests run with a fake core ingestion function without OpenAI credentials.
+- An opt-in integration test uses the real OpenAI API, validates that every
+  generated source reference names an input note, and persists a snapshot.
 - Contract tests for the versioned OpenAI Structured Outputs schema.
+- Tests verify one organization trigger per newly created note, no trigger for a
+  duplicate, and preservation of a note when organization fails.
 - Integration tests for idempotent inbound messages and outbound retries.
 - Security tests for cross-household access, malicious media, SSRF, and signed URL
   expiry.
@@ -323,8 +353,11 @@ built independently.
 1. An approved family member sends a plain-text SMS to the Homie number.
 2. Homie stores the message as an immutable note assigned to the household's
    local date.
-3. The organizer reads that day's notes and saves an updated summary and plan.
-4. A digest can be generated on demand and, once scheduling is connected, sent
+3. Every newly stored note triggers organization of that day's complete note
+   set; notes are not batched before processing.
+4. The organizer saves a new, traceable snapshot containing the current summary,
+   plan, and digest text.
+5. A digest can be generated on demand and, once scheduling is connected, sent
    once per day by SMS.
 
 The organizer must also accept test notes with the same stored-note shape so it
@@ -339,6 +372,11 @@ can be developed without Twilio credentials or a live phone number.
   note ID.
 - The organizer loads source notes from the backend; events and model prompts do
   not become the system of record.
+- Note persistence and organization are separate operations. The organizer can
+  run asynchronously and can also be invoked manually for retries or rebuilding
+  a time window.
+- Organization accepts a generic day, week, or month window. The barebones MVP
+  implements day windows only without making the core organizer day-specific.
 - Every generated summary or plan remains traceable to its source note IDs.
 
 ### Barebones success criteria
@@ -346,8 +384,11 @@ can be developed without Twilio credentials or a live phone number.
 - A fixture note and a Twilio-originated note can travel through the same core
   ingestion contract.
 - Duplicate provider delivery does not create a duplicate note.
-- Adding a note can update the correct household/day summary and plan.
-- A human-readable digest can be generated from the stored daily state.
+- Each newly created note triggers exactly one organization attempt; duplicate
+  delivery does not trigger another attempt.
+- Organization uses the real OpenAI integration in the end-to-end fixture path,
+  validates all cited note IDs, and leaves persisted notes intact on failure.
+- A human-readable digest can be generated from the saved organization snapshot.
 - Each workstream can run its tests without the other workstream's external
   service credentials.
 

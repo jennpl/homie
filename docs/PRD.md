@@ -53,8 +53,11 @@ built independently.
 1. An approved family member sends a plain-text SMS to the Homie number.
 2. Homie stores the message as an immutable note assigned to the household's
    local date.
-3. The organizer reads that day's notes and saves an updated summary and plan.
-4. A digest can be generated on demand and, once scheduling is connected, sent
+3. Every newly stored note triggers organization of that day's complete note
+   set; notes are not batched before processing.
+4. The organizer saves a new, traceable snapshot containing the current summary,
+   plan, and digest text.
+5. A digest can be generated on demand and, once scheduling is connected, sent
    once per day by SMS.
 
 The organizer must also accept test notes with the same stored-note shape so it
@@ -69,6 +72,11 @@ can be developed without Twilio credentials or a live phone number.
   note ID.
 - The organizer loads source notes from the backend; events and model prompts do
   not become the system of record.
+- Note persistence and organization are separate operations. The organizer can
+  run asynchronously and can also be invoked manually for retries or rebuilding
+  a time window.
+- Organization accepts a generic day, week, or month window. The barebones MVP
+  implements day windows only without making the core organizer day-specific.
 - Every generated summary or plan remains traceable to its source note IDs.
 
 ### Barebones success criteria
@@ -76,8 +84,11 @@ can be developed without Twilio credentials or a live phone number.
 - A fixture note and a Twilio-originated note can travel through the same core
   ingestion contract.
 - Duplicate provider delivery does not create a duplicate note.
-- Adding a note can update the correct household/day summary and plan.
-- A human-readable digest can be generated from the stored daily state.
+- Each newly created note triggers exactly one organization attempt; duplicate
+  delivery does not trigger another attempt.
+- Organization uses the real OpenAI integration in the end-to-end fixture path,
+  validates all cited note IDs, and leaves persisted notes intact on failure.
+- A human-readable digest can be generated from the saved organization snapshot.
 - Each workstream can run its tests without the other workstream's external
   service credentials.
 

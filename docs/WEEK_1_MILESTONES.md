@@ -7,13 +7,17 @@ plan while the Twilio and organizer workstreams remain independently testable.
 
 ## Definition of done
 
-- One preconfigured household and two test members exist in local PostgreSQL.
+- One shared Neon development database has the committed schema and isolated
+  `tony-test`, `partner-test`, and `shared-demo` households.
 - A shared core function can save an immutable `Note` and produce
   `NoteCreatedV1`.
 - A fixture adapter can create test notes without Twilio.
 - The Twilio adapter can hand a normalized note to the same core function.
-- The organizer can load a household/day, save a grounded summary and plan, and
-  render digest text.
+- Every newly created note triggers one day-window organization attempt; a
+  duplicate note triggers none.
+- The generic `organize` function can load a household/window, call OpenAI, save
+  a grounded organization snapshot, and render digest text.
+- A manual command can call `organize` separately for retry or rebuilding.
 - Both workstreams have focused tests that require neither the other person's
   code nor the other service's credentials.
 - The two paths are demonstrated together once at the end of the week.
@@ -42,18 +46,35 @@ export type NoteCreatedV1 = {
 };
 ```
 
-The core ingestion function owns IDs, date assignment, persistence, and event
-emission. Adapters supply source data; the organizer always reloads notes from
-PostgreSQL.
+The core ingestion function owns IDs, date assignment, persistence, idempotency,
+and event emission. Adapters supply source data; the organizer always reloads
+notes from PostgreSQL. `appendNote` never calls OpenAI directly.
+
+```ts
+export type OrganizationWindow = {
+  kind: "day" | "week" | "month";
+  startDate: string;
+  endDateExclusive: string;
+};
+
+export type OrganizeInput = {
+  householdId: string;
+  window: OrganizationWindow;
+  reason: "note.created" | "manual" | "scheduled" | "retry";
+};
+```
+
+The Week 1 implementation supports `kind: "day"`; the generic contract avoids
+coupling the organizer to daily processing.
 
 ## Timeboxed milestones
 
 | Time | Owner | Milestone | Evidence |
 | --- | --- | --- | --- |
-| 30 min | Together | Scaffold TypeScript backend, migration, seed household, shared contracts, and interfaces. | Both test suites compile against the same contracts. |
+| 30 min | Together | Scaffold TypeScript backend, one Neon database, migration, three isolated seed households, shared contracts, and `.env.example`. | Both developers run the same schema while selecting different test household IDs. |
 | 75 min | Twilio owner | Implement the inbound adapter against a fake `appendNote`; add one success and one duplicate-delivery test. | A captured or representative SMS payload produces one normalized call. |
-| 90 min | Organizer owner | Build fixture loader, `organizeDay`, structured result validation, and digest renderer. | `npm` command turns a fixture day into saved summary/plan JSON and digest text. |
-| 45 min | Together | Replace both fakes with the real core repository/event handoff and run one integration test. | A stored note triggers one daily-state update. |
+| 90 min | Organizer owner | Build fixture loader, generic `organize`, real OpenAI structured output, source validation, snapshot persistence, and digest renderer. | `npm` command turns a fixture day into a saved organization snapshot and digest text. |
+| 45 min | Together | Replace both fakes with the real core repository/event handoff and run one integration test. | A new stored note triggers one snapshot; a duplicate triggers none. |
 | 30-60 min | Together | Fix integration gaps, document commands, and attempt live Vercel/Twilio smoke test. | Repeatable README steps; live SMS if credentials and deployment are ready. |
 
 Total: 4 hours 30 minutes to 5 hours.
@@ -72,7 +93,7 @@ Owns:
 Does not own:
 
 - PostgreSQL schema beyond using the shared repository interface
-- AI prompts, planner output, daily state, or digest composition
+- AI prompts, planner output, organization snapshots, or digest composition
 
 ### Organizer workstream
 
@@ -81,7 +102,8 @@ Owns:
 - `src/organizer/`
 - Test-note fixtures and fixture runner
 - Structured summarizer/planner output
-- Source-note validation, daily-state persistence, and digest rendering
+- Generic organization windows and day-window helper
+- Source-note validation, snapshot persistence, and digest rendering
 
 Does not own:
 
@@ -95,6 +117,11 @@ Keep this small and change it together:
 - `src/core/notes/append-note.ts`
 - `src/repositories/notes.ts`
 - Initial migration and seed data
+
+Both developers copy `.env.example` to `.env.local`, share the development
+`DATABASE_URL` securely, and choose their own seeded `HOMIE_HOUSEHOLD_ID`.
+Database changes are made only through committed migrations so each checkout
+stays compatible.
 
 ## Suggested fixture day
 
@@ -136,7 +163,9 @@ To protect the timebox, stop and defer when work requires:
 
 ## End-of-week demo
 
-1. Run the fixture path and show the saved daily state and digest.
+1. Run the fixture path through the real OpenAI API and show the saved day-window
+   organization snapshot and digest.
 2. Run the Twilio adapter test and show the identical core note call.
-3. Run the integration test from a stored note through the organizer.
+3. Run the integration test from a stored note through the organizer, then show
+   that duplicate ingestion does not create another snapshot.
 4. If deployed, send one live SMS and manually trigger its digest.
