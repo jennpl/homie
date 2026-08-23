@@ -8,8 +8,9 @@ Last updated: 2026-08-22
 
 Homie gives a household one phone number to which approved family members can
 send texts and photos. Homie organizes those contributions into a private
-family timeline and sends an optional daily digest containing upcoming plans,
-open tasks, reminders, and recent moments.
+family timeline. AI-assisted organization turns the day's unstructured notes
+into proposed plans, tasks, reminders, and moments, then Homie sends an optional
+daily digest by text, email, or both.
 
 ## Problem
 
@@ -66,15 +67,19 @@ Examples:
 ### Review and correction
 
 The web app shows a chronological inbox and structured items derived from it.
-An organizer can edit, confirm, complete, dismiss, or delete items. The original
-message remains linked to each derived item for traceability.
+AI processes the household's daily notes and photo captions to group related
+updates, extract actionable items, and draft a concise digest. An organizer can
+edit, confirm, complete, dismiss, or delete items. The original message remains
+linked to each derived item for traceability, and AI-generated suggestions are
+always presented as editable rather than authoritative.
 
 ### Daily digest
 
 At the household's configured local time, opted-in members receive a concise
-digest by SMS. It includes today's events and reminders, overdue and open tasks,
-and a small selection of recent moments. If there is nothing actionable or new,
-Homie does not send an empty digest.
+digest by SMS, email, or both according to their preferences. It includes today's
+events and reminders, overdue and open tasks, and a small selection of recent
+moments. If there is nothing actionable or new, Homie does not send an empty
+digest.
 
 ### SMS commands
 
@@ -91,13 +96,14 @@ Homie does not send an empty digest.
 | FR-1 | Provision one inbound SMS/MMS number per household or provide equivalent isolated routing. |
 | FR-2 | Accept content only from consented household members and safely reject unknown senders. |
 | FR-3 | Store the original message, sender, received time, attachments, and provider identifiers idempotently. |
-| FR-4 | Extract proposed events, tasks, reminders, notes, and moments while preserving the source message. |
+| FR-4 | Use AI assistance to organize daily notes and extract proposed events, tasks, reminders, notes, and moments while preserving every source message. |
 | FR-5 | Support organizer review, correction, completion, dismissal, and deletion in a responsive web app. |
-| FR-6 | Generate digests in the household time zone and deliver only to opted-in recipients. |
+| FR-6 | Generate digests in the household time zone and deliver through each opted-in recipient's selected SMS and/or email channels. |
 | FR-7 | Honor messaging compliance commands immediately and maintain auditable consent records. |
 | FR-8 | Allow household export and deletion, including stored media and derived data. |
 | FR-9 | Scan uploads, enforce file type and size limits, and strip unnecessary image metadata. |
 | FR-10 | Prevent one household from accessing another household's messages, media, or derived items. |
+| FR-11 | Track outbound SMS and email delivery outcomes and stop retrying suppressed or opted-out destinations. |
 
 ## Non-functional requirements
 
@@ -124,7 +130,7 @@ Homie does not send an empty digest.
 ### Included
 
 - US/Canada SMS and MMS, English language, one household per account, responsive
-  web administration, daily SMS digest, and basic export/deletion.
+  web administration, daily SMS/email digest, and basic export/deletion.
 
 ### Not included
 

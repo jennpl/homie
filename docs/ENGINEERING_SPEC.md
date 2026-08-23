@@ -2,7 +2,7 @@
 
 Status: Draft  
 Owners: Engineering  
-PRD revision: <!-- prd-sha256: 0c44118dd660c8c991c74cdb80ea96c8018e14ec5af0d9f420730d9818df5b53 -->
+PRD revision: <!-- prd-sha256: 664c3c52b0e1c3abfea2283a126aae694fe58a6e14d77ae2e3e0ebaefa70abeb -->
 
 ## Scope
 
@@ -20,10 +20,14 @@ isolation, and the ability to replace communications or AI vendors.
   encryption, and short-lived signed URLs.
 - **Queue and scheduler:** durable jobs for extraction, media processing,
   follow-ups, digest generation, delivery, retries, export, and deletion.
-- **Messaging adapter:** vendor-neutral interface over an SMS/MMS provider.
-- **Extraction adapter:** schema-constrained model call behind a provider-neutral
-  interface, followed by deterministic validation of dates, membership, and
-  allowed item types.
+- **SMS/MMS:** Twilio Programmable Messaging for inbound webhooks, outbound SMS
+  and MMS, messaging services, and delivery status callbacks.
+- **Email:** Twilio SendGrid v3 Mail Send API for digest and transactional email,
+  with Event Webhook processing for delivery and suppression state.
+- **AI organization:** OpenAI Responses API using a GPT model with text/image
+  inputs and Structured Outputs. The integration returns schema-constrained
+  proposed items and digest sections, followed by deterministic validation of
+  dates, membership, source references, and allowed item types.
 
 The MVP should begin as a modular monolith with separate web and worker
 processes. Splitting services early would add operational cost without improving
@@ -31,18 +35,21 @@ household isolation or delivery reliability.
 
 ## Main flow
 
-1. The messaging provider posts a signed webhook.
+1. Twilio posts a signed inbound Messaging webhook for an SMS or MMS.
 2. The API verifies the signature, normalizes sender and provider identifiers,
    persists the raw envelope idempotently, enqueues processing, and returns 2xx.
 3. A worker verifies consent and household routing, fetches media from an
    allowlisted provider origin, scans it, stores a sanitized copy, and creates a
    timeline message.
-4. The extraction adapter returns zero or more typed proposals with confidence
-   and source spans. Deterministic validators reject impossible or unsafe data.
+4. A daily organization job submits the day's normalized notes and permitted
+   photo context to the OpenAI Responses API. Structured Outputs return zero or
+   more typed proposals, source references, confidence signals, and digest
+   sections. Deterministic validators reject impossible or unsafe data.
 5. High-confidence proposals become visible structured items. Ambiguous items
    remain pending and can generate one short follow-up question.
 6. The scheduler creates one immutable digest record per household and local
-   date. Delivery jobs fan out only to members eligible at send time.
+   date. Delivery jobs send through Twilio SMS and/or Twilio SendGrid only to
+   members eligible for each channel at send time.
 
 ## Data model
 
@@ -50,14 +57,16 @@ household isolation or delivery reliability.
 | --- | --- |
 | User | id, auth_subject, display_name, created_at |
 | Household | id, name, timezone, digest_local_time, status |
-| Membership | household_id, user_id/phone_id, role, status |
+| Membership | household_id, user_id, role, status |
 | PhoneIdentity | id, normalized_number, verified_at |
-| ConsentEvent | phone_identity_id, household_id, action, source, occurred_at |
+| EmailIdentity | id, normalized_email, verified_at |
+| ConsentEvent | household_id, membership_id, channel, destination_id, action, source, occurred_at |
 | Message | id, household_id, sender_id, provider_message_id, body_ciphertext, received_at |
 | Media | id, message_id, object_key, media_type, scan_status, byte_size |
 | Item | id, household_id, source_message_id, type, status, title, due_at, confidence |
 | Digest | id, household_id, local_date, content, generated_at |
-| Delivery | id, digest_id/message_id, recipient_id, provider_id, status, attempts |
+| DeliveryPreference | membership_id, sms_enabled, email_enabled |
+| Delivery | id, channel, digest_id/message_id, recipient_id, provider_id, status, attempts |
 
 All household-owned tables include `household_id`. Access requires an explicit
 membership check; identifiers alone never authorize access. Provider payloads
@@ -65,14 +74,48 @@ are retained only as long as needed for reconciliation.
 
 ## Interfaces
 
-### Messaging provider webhook
+### Twilio Programmable Messaging
 
-`POST /webhooks/messaging/inbound`
+`POST /webhooks/twilio/messaging/inbound`
 
-- Verify the provider signature against the exact public URL and raw request.
-- Use the provider message ID as the idempotency key.
-- Return success after durable receipt, not after extraction.
-- Process STOP/START semantics before ordinary content.
+- Verify `X-Twilio-Signature` against the exact public URL and request parameters.
+- Use Twilio's Message SID as the idempotency key.
+- Persist the envelope and return TwiML success after durable receipt, not after
+  OpenAI processing.
+- Process STOP/START semantics before ordinary content and mirror Twilio's
+  messaging-service opt-out state locally.
+- Send outbound SMS/MMS through the Twilio Message resource and include a status
+  callback URL on every application-originated message.
+
+`POST /webhooks/twilio/messaging/status`
+
+- Authenticate the callback, update delivery state monotonically, retain the
+  Twilio Message SID, and treat duplicate or out-of-order callbacks idempotently.
+
+### Twilio SendGrid
+
+- Send email through `POST /v3/mail/send` using a restricted API key, verified
+  sender/domain, stable template IDs, and opaque custom arguments.
+- Keep email rendering separate from SMS composition; include text and HTML
+  bodies, unsubscribe controls, and no private content in subject lines.
+- Consume signed SendGrid Event Webhooks at
+  `POST /webhooks/twilio/sendgrid/events` to update delivery, bounce, spam-report,
+  and unsubscribe state idempotently.
+
+### OpenAI daily-note organization
+
+- Call `POST /v1/responses` from a worker, never from the inbound webhook path.
+- Provide the minimum necessary household notes and sanitized photo context for
+  the current processing window; do not send phone numbers, email addresses, or
+  provider identifiers.
+- Require Structured Outputs matching a versioned JSON Schema for `event`,
+  `task`, `reminder`, `note`, `moment`, and `digest_section` objects.
+- Require source message IDs for every proposed item, reject unknown sources,
+  and validate all dates and time zones deterministically.
+- Store prompt/schema versions, model ID, latency, token usage, and outcome, but
+  never log prompt or response content.
+- A failed or invalid model response leaves source notes intact and retryable; it
+  must never block ingestion or fabricate a successful digest.
 
 ### Organizer API
 
@@ -91,17 +134,21 @@ every request, cursor pagination, and an idempotency key on retriable creates.
 ## Digest behavior
 
 The scheduler scans time-zone buckets and enqueues a unique job keyed by
-`household_id + local_date`. Generation reads a consistent snapshot, prioritizes
-time-sensitive items, and applies a strict SMS segment budget. A digest is
-skipped when there is no actionable or new content. Recipient consent and
-membership are checked again immediately before each delivery.
+`household_id + local_date`. Generation reads a consistent snapshot, asks OpenAI
+for schema-constrained organization and digest sections, then deterministically
+renders channel-specific output. SMS applies a strict segment budget; email can
+include a richer summary and sanitized thumbnail links. A digest is skipped when
+there is no actionable or new content. Recipient consent, membership, email
+suppression state, and per-channel preferences are checked immediately before
+each delivery.
 
 ## Privacy, safety, and compliance
 
 - Treat message bodies and media as highly sensitive family content.
 - Encrypt sensitive fields and separate encryption keys from application data.
 - Never place message content in logs, traces, analytics, or model-training data.
-- Configure extraction providers for no retention where contractually available.
+- Configure OpenAI data controls and retention appropriate for private family
+  content, and document the selected account-level settings before alpha.
 - Rate-limit unknown senders and do not reveal household membership.
 - Validate MIME type from bytes, cap downloads, block redirects to private
   networks, scan files, and re-encode accepted images.
@@ -123,7 +170,8 @@ membership are checked again immediately before each delivery.
 
 - Unit tests for parsing, time zones, command precedence, authorization, digest
   selection, and extraction validation.
-- Contract tests for provider signature validation and adapter payloads.
+- Contract tests for Twilio/SendGrid signatures, callbacks, adapter payloads, and
+  the versioned OpenAI Structured Outputs schema.
 - Integration tests for idempotent inbound messages and outbound retries.
 - Security tests for cross-household access, malicious media, SSRF, and signed URL
   expiry.
@@ -134,18 +182,28 @@ membership are checked again immediately before each delivery.
 
 1. Repository foundations, auth, households, membership, and consent ledger.
 2. Inbound text pipeline, timeline, and organizer correction flow.
-3. Structured extraction with evaluation harness and confidence handling.
+3. OpenAI daily-note organization with Structured Outputs, evaluation harness,
+   source grounding, and confidence handling.
 4. Media ingestion and sanitized private viewing.
-5. Digest scheduler, composition, delivery, and preference controls.
+5. Digest scheduler, Twilio SMS and SendGrid email delivery, channel preferences,
+   callbacks, and suppression controls.
 6. Export/deletion, reconciliation, dashboards, security review, and alpha launch.
 
 ## Decisions still required
 
-- Messaging provider and dedicated-versus-pooled number strategy.
+- Dedicated-versus-pooled Twilio number strategy and Messaging Service topology.
 - Hosting platform, queue implementation, and object storage provider.
 - Identity provider and policy for members without web accounts.
-- Retention defaults, age/minor policy, supported image limits, and AI provider.
+- Retention defaults, age/minor policy, supported image limits, OpenAI model,
+  prompt versioning policy, and acceptable per-digest inference cost.
 - Exact alpha service objectives and per-household cost ceiling.
+
+## Vendor references
+
+- [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+- [Twilio Messaging webhooks](https://www.twilio.com/docs/usage/webhooks/messaging-webhooks)
+- [Twilio outbound SMS/MMS](https://www.twilio.com/docs/messaging/tutorials/how-to-send-sms-messages)
+- [Twilio SendGrid Mail Send API](https://www.twilio.com/docs/sendgrid/api-reference/mail-send)
 
 ## Synchronized PRD snapshot
 
@@ -163,8 +221,9 @@ Last updated: 2026-08-22
 
 Homie gives a household one phone number to which approved family members can
 send texts and photos. Homie organizes those contributions into a private
-family timeline and sends an optional daily digest containing upcoming plans,
-open tasks, reminders, and recent moments.
+family timeline. AI-assisted organization turns the day's unstructured notes
+into proposed plans, tasks, reminders, and moments, then Homie sends an optional
+daily digest by text, email, or both.
 
 ## Problem
 
@@ -221,15 +280,19 @@ Examples:
 ### Review and correction
 
 The web app shows a chronological inbox and structured items derived from it.
-An organizer can edit, confirm, complete, dismiss, or delete items. The original
-message remains linked to each derived item for traceability.
+AI processes the household's daily notes and photo captions to group related
+updates, extract actionable items, and draft a concise digest. An organizer can
+edit, confirm, complete, dismiss, or delete items. The original message remains
+linked to each derived item for traceability, and AI-generated suggestions are
+always presented as editable rather than authoritative.
 
 ### Daily digest
 
 At the household's configured local time, opted-in members receive a concise
-digest by SMS. It includes today's events and reminders, overdue and open tasks,
-and a small selection of recent moments. If there is nothing actionable or new,
-Homie does not send an empty digest.
+digest by SMS, email, or both according to their preferences. It includes today's
+events and reminders, overdue and open tasks, and a small selection of recent
+moments. If there is nothing actionable or new, Homie does not send an empty
+digest.
 
 ### SMS commands
 
@@ -246,13 +309,14 @@ Homie does not send an empty digest.
 | FR-1 | Provision one inbound SMS/MMS number per household or provide equivalent isolated routing. |
 | FR-2 | Accept content only from consented household members and safely reject unknown senders. |
 | FR-3 | Store the original message, sender, received time, attachments, and provider identifiers idempotently. |
-| FR-4 | Extract proposed events, tasks, reminders, notes, and moments while preserving the source message. |
+| FR-4 | Use AI assistance to organize daily notes and extract proposed events, tasks, reminders, notes, and moments while preserving every source message. |
 | FR-5 | Support organizer review, correction, completion, dismissal, and deletion in a responsive web app. |
-| FR-6 | Generate digests in the household time zone and deliver only to opted-in recipients. |
+| FR-6 | Generate digests in the household time zone and deliver through each opted-in recipient's selected SMS and/or email channels. |
 | FR-7 | Honor messaging compliance commands immediately and maintain auditable consent records. |
 | FR-8 | Allow household export and deletion, including stored media and derived data. |
 | FR-9 | Scan uploads, enforce file type and size limits, and strip unnecessary image metadata. |
 | FR-10 | Prevent one household from accessing another household's messages, media, or derived items. |
+| FR-11 | Track outbound SMS and email delivery outcomes and stop retrying suppressed or opted-out destinations. |
 
 ## Non-functional requirements
 
@@ -279,7 +343,7 @@ Homie does not send an empty digest.
 ### Included
 
 - US/Canada SMS and MMS, English language, one household per account, responsive
-  web administration, daily SMS digest, and basic export/deletion.
+  web administration, daily SMS/email digest, and basic export/deletion.
 
 ### Not included
 
