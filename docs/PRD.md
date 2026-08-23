@@ -2,7 +2,7 @@
 
 Status: Draft  
 Owner: Product  
-Last updated: 2026-08-22
+Last updated: 2026-08-23
 
 ## Summary
 
@@ -41,7 +41,56 @@ and one person often becomes the household's unofficial administrator.
 3. Keep useful family moments together without searching old group chats.
 4. Include relatives who will not install or learn a new application.
 
-## MVP experience
+## Barebones MVP
+
+The first usable slice is a backend-only, text-only family notebook for one
+preconfigured household. Its purpose is to prove the loop from capture to an
+organized daily plan while allowing the SMS integration and AI organizer to be
+built independently.
+
+### User experience
+
+1. An approved family member sends a plain-text SMS to the Homie number.
+2. Homie stores the message as an immutable note assigned to the household's
+   local date.
+3. The organizer reads that day's notes and saves an updated summary and plan.
+4. A digest can be generated on demand and, once scheduling is connected, sent
+   once per day by SMS.
+
+The organizer must also accept test notes with the same stored-note shape so it
+can be developed without Twilio credentials or a live phone number.
+
+### Shared product contract
+
+- Every accepted SMS produces exactly one stored note.
+- Each note contains an ID, household ID, author ID, text, received time, and
+  household-local date.
+- A saved note produces a versioned `note.created` event containing only its
+  note ID.
+- The organizer loads source notes from the backend; events and model prompts do
+  not become the system of record.
+- Every generated summary or plan remains traceable to its source note IDs.
+
+### Barebones success criteria
+
+- A fixture note and a Twilio-originated note can travel through the same core
+  ingestion contract.
+- Duplicate provider delivery does not create a duplicate note.
+- Adding a note can update the correct household/day summary and plan.
+- A human-readable digest can be generated from the stored daily state.
+- Each workstream can run its tests without the other workstream's external
+  service credentials.
+
+### Deferred from the barebones MVP
+
+- Photos and MMS processing, email, web UI, self-serve household setup, multiple
+  households, correction workflows, search, exports, and production-grade queue
+  recovery.
+- Automatic daily scheduling is the first follow-on if it does not fit the
+  initial one-week timebox; manual digest generation is sufficient to prove the
+  product loop.
+
+## Target MVP experience
 
 ### Household setup
 
@@ -125,7 +174,7 @@ digest.
 - Fewer than 2% of digests are muted or opted out within seven days of first send.
 - No cross-household data exposure and 100% successful processing of STOP events.
 
-## MVP boundaries
+## Target MVP boundaries
 
 ### Included
 

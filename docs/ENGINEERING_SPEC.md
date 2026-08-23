@@ -2,22 +2,83 @@
 
 Status: Draft  
 Owners: Engineering  
-PRD revision: <!-- prd-sha256: 664c3c52b0e1c3abfea2283a126aae694fe58a6e14d77ae2e3e0ebaefa70abeb -->
+PRD revision: <!-- prd-sha256: ee772b8759c8c7c6d36497b1960901301cd86a946e48b5f03ff98f795d6d2f22 -->
 
 ## Scope
 
-This specification covers the MVP described by the PRD. The architecture favors
-a small deployable surface, reliable asynchronous processing, strict household
-isolation, and the ability to replace communications or AI vendors.
+This specification covers both the one-week barebones proof and the broader MVP
+described by the PRD. The first implementation is backend-only and text-only.
+The architecture favors a small deployable surface, reliable asynchronous
+processing, strict household isolation, and replaceable communications and AI
+adapters.
+
+## Barebones MVP slice
+
+The first slice runs as a TypeScript backend on Vercel, stores notes and daily
+state in managed PostgreSQL, accepts inbound text through a Twilio adapter, and
+uses the OpenAI Responses API to produce structured summaries and plans. There
+is no frontend, MMS, email, or self-serve onboarding in this slice.
+
+The Twilio and organizer implementations share only two versioned contracts.
+Provider-specific request details must not leak across this boundary.
+
+```ts
+export type Note = {
+  id: string;
+  householdId: string;
+  authorId: string;
+  text: string;
+  receivedAt: string; // UTC ISO-8601 timestamp
+  localDate: string;  // YYYY-MM-DD in the household timezone
+};
+
+export type NoteCreatedV1 = {
+  type: "note.created";
+  version: 1;
+  noteId: string;
+};
+```
+
+The SMS workstream converts a valid provider message into a committed `Note`,
+then emits `NoteCreatedV1`. The organizer workstream receives the event, loads
+the note and its household/day peers from PostgreSQL, and updates the daily
+state. Test fixtures create the same `Note` shape and bypass Twilio entirely.
+
+The event carries no message body, phone number, household routing data, or
+provider payload. PostgreSQL is the system of record. Emission must occur only
+after the note is committed; a production implementation should use an outbox
+or equivalent durable mechanism.
+
+### Barebones organization input
+
+```ts
+export type OrganizeDayInput = {
+  householdId: string;
+  localDate: string;
+  timezone: string;
+  notes: Array<{
+    id: string;
+    authorName: string;
+    text: string;
+    receivedAt: string;
+  }>;
+};
+```
+
+`organizeDay` is provider-neutral and can be exercised from a fixture-backed CLI
+or test. It returns a schema-validated summary, plan items, and the source note
+IDs used for each result.
 
 ## Proposed architecture
 
-- **Web/API:** TypeScript application providing the organizer UI, authenticated
-  APIs, provider webhooks, and internal admin endpoints.
+- **Web/API:** TypeScript Vercel Functions providing provider webhooks and
+  backend-only internal endpoints in the barebones slice; authenticated organizer
+  APIs and UI follow later.
 - **Primary data store:** PostgreSQL with household-scoped foreign keys and
   row-level authorization enforced in the data-access layer.
-- **Media:** private object storage with malware scanning, metadata stripping,
-  encryption, and short-lived signed URLs.
+- **Media:** deferred from the barebones slice; the target MVP uses private object
+  storage with malware scanning, metadata stripping, encryption, and short-lived
+  signed URLs.
 - **Queue and scheduler:** durable jobs for extraction, media processing,
   follow-ups, digest generation, delivery, retries, export, and deletion.
 - **SMS/MMS:** Twilio Programmable Messaging for inbound webhooks, outbound SMS
@@ -29,27 +90,22 @@ isolation, and the ability to replace communications or AI vendors.
   proposed items and digest sections, followed by deterministic validation of
   dates, membership, source references, and allowed item types.
 
-The MVP should begin as a modular monolith with separate web and worker
-processes. Splitting services early would add operational cost without improving
-household isolation or delivery reliability.
+The implementation begins as one modular backend with clear adapter, core note,
+and organizer modules. Splitting deployable services early would add operational
+cost without improving household isolation or delivery reliability.
 
 ## Main flow
 
-1. Twilio posts a signed inbound Messaging webhook for an SMS or MMS.
-2. The API verifies the signature, normalizes sender and provider identifiers,
-   persists the raw envelope idempotently, enqueues processing, and returns 2xx.
-3. A worker verifies consent and household routing, fetches media from an
-   allowlisted provider origin, scans it, stores a sanitized copy, and creates a
-   timeline message.
-4. A daily organization job submits the day's normalized notes and permitted
-   photo context to the OpenAI Responses API. Structured Outputs return zero or
-   more typed proposals, source references, confidence signals, and digest
-   sections. Deterministic validators reject impossible or unsafe data.
-5. High-confidence proposals become visible structured items. Ambiguous items
-   remain pending and can generate one short follow-up question.
-6. The scheduler creates one immutable digest record per household and local
-   date. Delivery jobs send through Twilio SMS and/or Twilio SendGrid only to
-   members eligible for each channel at send time.
+1. The Twilio adapter receives an inbound SMS, resolves its household and author,
+   and calls the core note-ingestion function.
+2. Core ingestion stores one immutable `Note` and emits `NoteCreatedV1` after the
+   transaction commits.
+3. The organizer loads all notes for that household/local date and submits them
+   to the OpenAI Responses API using Structured Outputs.
+4. Deterministic validation requires valid source note IDs and dates before a
+   versioned daily summary and plan are saved.
+5. A digest renderer reads the daily state and produces plain SMS text. It can be
+   invoked manually in the first slice; a scheduler and outbound delivery follow.
 
 ## Data model
 
@@ -61,16 +117,19 @@ household isolation or delivery reliability.
 | PhoneIdentity | id, normalized_number, verified_at |
 | EmailIdentity | id, normalized_email, verified_at |
 | ConsentEvent | household_id, membership_id, channel, destination_id, action, source, occurred_at |
-| Message | id, household_id, sender_id, provider_message_id, body_ciphertext, received_at |
-| Media | id, message_id, object_key, media_type, scan_status, byte_size |
+| Note | id, household_id, author_id, text, received_at, local_date, source_provider, source_external_id |
+| DailyState | household_id, local_date, version, summary_json, plan_json, updated_at |
+| OutboxEvent | id, event_type, schema_version, aggregate_id, payload, created_at, published_at |
+| Media | id, note_id, object_key, media_type, scan_status, byte_size |
 | Item | id, household_id, source_message_id, type, status, title, due_at, confidence |
 | Digest | id, household_id, local_date, content, generated_at |
 | DeliveryPreference | membership_id, sms_enabled, email_enabled |
 | Delivery | id, channel, digest_id/message_id, recipient_id, provider_id, status, attempts |
 
-All household-owned tables include `household_id`. Access requires an explicit
-membership check; identifiers alone never authorize access. Provider payloads
-are retained only as long as needed for reconciliation.
+The barebones migration needs only Household, Membership/PhoneIdentity, Note,
+DailyState, and an event handoff. `(source_provider, source_external_id)` is
+unique. All household-owned tables include `household_id`; provider payloads are
+adapter concerns and are not inputs to the organizer.
 
 ## Interfaces
 
@@ -78,19 +137,14 @@ are retained only as long as needed for reconciliation.
 
 `POST /webhooks/twilio/messaging/inbound`
 
-- Verify `X-Twilio-Signature` against the exact public URL and request parameters.
-- Use Twilio's Message SID as the idempotency key.
-- Persist the envelope and return TwiML success after durable receipt, not after
-  OpenAI processing.
-- Process STOP/START semantics before ordinary content and mirror Twilio's
-  messaging-service opt-out state locally.
-- Send outbound SMS/MMS through the Twilio Message resource and include a status
-  callback URL on every application-originated message.
+- The adapter owns Twilio validation, parsing, sender routing, compliance, and
+  provider retries.
+- Its shared obligation is to call core ingestion with one normalized note,
+  using the Twilio Message SID as the source external ID.
+- It returns only after the note is durably committed; AI processing is outside
+  the webhook contract.
 
-`POST /webhooks/twilio/messaging/status`
-
-- Authenticate the callback, update delivery state monotonically, retain the
-  Twilio Message SID, and treat duplicate or out-of-order callbacks idempotently.
+Outbound status handling is deferred until automated digest delivery is added.
 
 ### Twilio SendGrid
 
@@ -105,11 +159,11 @@ are retained only as long as needed for reconciliation.
 ### OpenAI daily-note organization
 
 - Call `POST /v1/responses` from a worker, never from the inbound webhook path.
-- Provide the minimum necessary household notes and sanitized photo context for
-  the current processing window; do not send phone numbers, email addresses, or
-  provider identifiers.
-- Require Structured Outputs matching a versioned JSON Schema for `event`,
-  `task`, `reminder`, `note`, `moment`, and `digest_section` objects.
+- Provide only normalized notes for one household/local date; do not send phone
+  numbers, email addresses, provider identifiers, or raw webhook data.
+- For the barebones slice, require Structured Outputs matching a versioned schema
+  for `summary`, `plan_item`, and `source_note_ids`. Richer event, task, reminder,
+  note, moment, and digest schemas follow after the loop is proven.
 - Require source message IDs for every proposed item, reject unknown sources,
   and validate all dates and time zones deterministically.
 - Store prompt/schema versions, model ID, latency, token usage, and outcome, but
@@ -170,8 +224,11 @@ each delivery.
 
 - Unit tests for parsing, time zones, command precedence, authorization, digest
   selection, and extraction validation.
-- Contract tests for Twilio/SendGrid signatures, callbacks, adapter payloads, and
-  the versioned OpenAI Structured Outputs schema.
+- Shared contract tests proving both a fixture adapter and the Twilio adapter can
+  create the same `Note` shape and emit `NoteCreatedV1`.
+- Organizer tests run from fixtures without Twilio credentials; Twilio adapter
+  tests run with a fake core ingestion function without OpenAI credentials.
+- Contract tests for the versioned OpenAI Structured Outputs schema.
 - Integration tests for idempotent inbound messages and outbound retries.
 - Security tests for cross-household access, malicious media, SSRF, and signed URL
   expiry.
@@ -215,7 +272,7 @@ The section below is generated by `npm run docs:sync`. Do not edit it directly.
 
 Status: Draft  
 Owner: Product  
-Last updated: 2026-08-22
+Last updated: 2026-08-23
 
 ## Summary
 
@@ -254,7 +311,56 @@ and one person often becomes the household's unofficial administrator.
 3. Keep useful family moments together without searching old group chats.
 4. Include relatives who will not install or learn a new application.
 
-## MVP experience
+## Barebones MVP
+
+The first usable slice is a backend-only, text-only family notebook for one
+preconfigured household. Its purpose is to prove the loop from capture to an
+organized daily plan while allowing the SMS integration and AI organizer to be
+built independently.
+
+### User experience
+
+1. An approved family member sends a plain-text SMS to the Homie number.
+2. Homie stores the message as an immutable note assigned to the household's
+   local date.
+3. The organizer reads that day's notes and saves an updated summary and plan.
+4. A digest can be generated on demand and, once scheduling is connected, sent
+   once per day by SMS.
+
+The organizer must also accept test notes with the same stored-note shape so it
+can be developed without Twilio credentials or a live phone number.
+
+### Shared product contract
+
+- Every accepted SMS produces exactly one stored note.
+- Each note contains an ID, household ID, author ID, text, received time, and
+  household-local date.
+- A saved note produces a versioned `note.created` event containing only its
+  note ID.
+- The organizer loads source notes from the backend; events and model prompts do
+  not become the system of record.
+- Every generated summary or plan remains traceable to its source note IDs.
+
+### Barebones success criteria
+
+- A fixture note and a Twilio-originated note can travel through the same core
+  ingestion contract.
+- Duplicate provider delivery does not create a duplicate note.
+- Adding a note can update the correct household/day summary and plan.
+- A human-readable digest can be generated from the stored daily state.
+- Each workstream can run its tests without the other workstream's external
+  service credentials.
+
+### Deferred from the barebones MVP
+
+- Photos and MMS processing, email, web UI, self-serve household setup, multiple
+  households, correction workflows, search, exports, and production-grade queue
+  recovery.
+- Automatic daily scheduling is the first follow-on if it does not fit the
+  initial one-week timebox; manual digest generation is sufficient to prove the
+  product loop.
+
+## Target MVP experience
 
 ### Household setup
 
@@ -338,7 +444,7 @@ digest.
 - Fewer than 2% of digests are muted or opted out within seven days of first send.
 - No cross-household data exposure and 100% successful processing of STOP events.
 
-## MVP boundaries
+## Target MVP boundaries
 
 ### Included
 
