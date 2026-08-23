@@ -2,9 +2,31 @@
   "name": "homie",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
+    "build": "tsc --noEmit",
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "setup:tony": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-dev.ps1 -HouseholdId tony-test",
+    "setup:partner": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-dev.ps1 -HouseholdId partner-test",
+    "note:add": "tsx scripts/add-note.ts",
+    "organize": "tsx scripts/organize.ts",
     "docs:sync": "node scripts/sync-spec.mjs",
     "docs:check": "node scripts/sync-spec.mjs --check"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "openai": "^5.19.1",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
-
