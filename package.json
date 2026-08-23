@@ -1,0 +1,10 @@
+{
+  "name": "homie",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "docs:sync": "node scripts/sync-spec.mjs",
+    "docs:check": "node scripts/sync-spec.mjs --check"
+  }
+}
+
