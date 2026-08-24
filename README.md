@@ -39,7 +39,7 @@ organizer can be run again.
 ### One-time setup
 
 Use Node.js 22 or newer and create one Neon PostgreSQL development database.
-Tony and Partner can use the same database because each selects a separate seeded
+Both developers can use the same database because each selects a separate seeded
 household.
 
 ```powershell
@@ -47,7 +47,7 @@ npm.cmd install
 Copy-Item .env.example .env.local
 # Fill in DATABASE_URL, OPENAI_API_KEY, and HOMIE_INTERNAL_API_KEY.
 # Tony uses HOMIE_HOUSEHOLD_ID=tony-test.
-# Partner uses HOMIE_HOUSEHOLD_ID=partner-test.
+# The partner workstream uses HOMIE_HOUSEHOLD_ID=partner-test.
 npm.cmd run db:migrate
 npm.cmd run db:seed
 ```
@@ -58,14 +58,14 @@ For the shorter developer-specific setup, first clone the repository and run:
 # Tony
 npm.cmd run setup:tony
 
-# Partner
+# Partner workstream
 npm.cmd run setup:partner
 ```
 
 The first run installs dependencies, creates `.env.local`, and selects the
 developer's isolated household. If `DATABASE_URL` is still the placeholder, the
 script stops and asks for the shared Neon URL. Add it locally and run the same
-command again; the script then applies migrations and seed data. Partner does not
+command again; the script then applies migrations and seed data. The partner does not
 need `OPENAI_API_KEY` unless she wants to run the organizer herself.
 
 Share `DATABASE_URL` and other secrets outside Git. Schema changes belong in a
@@ -109,7 +109,7 @@ are for development only and should be replaced by authenticated product APIs.
 
 ### Independent Twilio work
 
-Partner's adapter only needs the shared note contract and database-backed note
+The Twilio adapter only needs the shared note contract and database-backed note
 service; it does not require OpenAI credentials:
 
 ```ts
